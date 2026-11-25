@@ -1,5 +1,5 @@
 """IngeniumBot and local Minecraft supervisor."""
-import asyncio, contextlib, datetime, hashlib, json, os, re, shutil, uuid
+import asyncio, contextlib, datetime, hashlib, json, os, re, shutil, socket, uuid
 from pathlib import Path
 import discord
 from discord import app_commands
@@ -14,6 +14,45 @@ LOG = re.compile(r"^\[.*?\]\s*(?:\[[^\]]+\]\s*)+(?::\s*|\s+)(.*)$")
 CHAT = re.compile(r"^(?:\[Not Secure\]\s*)?<([A-Za-z0-9_]{1,16})> (.*)$")
 JOIN = re.compile(r"^([A-Za-z0-9_]{1,16}) (joined|left) the game$")
 NO_MENTIONS = discord.AllowedMentions.none()
+
+
+@contextlib.contextmanager
+def runtime_guard(path):
+    """Keep an OS-level lock for the life of the supervisor; never unlink it."""
+    fd = os.open(path, os.O_CREAT | os.O_RDWR | getattr(os, "O_BINARY", 0))
+    with os.fdopen(fd, "r+b", buffering=0) as handle:
+        try:
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as e:
+            raise RuntimeError("Another Ingenium host may be running. Stop it before launching again.") from e
+        try:
+            handle.seek(0)
+            previous = handle.read()
+            if previous and previous != b"INGENIUM_LOCK_V2\n":
+                raise RuntimeError("Legacy runtime.lock detected. Verify that all old Ingenium Python and Java processes have stopped, then remove runtime.lock once and retry.")
+            handle.seek(0)
+            handle.write(b"INGENIUM_LOCK_V2\n")
+            handle.truncate()
+            yield
+        finally:
+            handle.seek(0)
+            if os.name == "nt":
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+def require_free_port():
+    # Catch a surviving Java process or another service before touching config.
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.settimeout(1)
+        if probe.connect_ex(("127.0.0.1", 25565)) == 0:
+            raise RuntimeError("Port 25565 is already accepting connections. Stop the existing server before starting Ingenium.")
 
 def load_config():
     c = json.loads(CONFIG.read_text(encoding="utf-8"))
@@ -98,6 +137,7 @@ class Host:
                 return "Host is shutting down."
             if self.proc and self.proc.returncode is None:
                 return "Minecraft is already running or starting."
+            require_free_port()
             self.preflight()
             ram=int(self.cfg["max_ram_gb"])
             self.proc=await asyncio.create_subprocess_exec(self.cfg["java"],"-Xms2G",f"-Xmx{ram}G","-jar","server.jar","nogui",cwd=SERVER,stdin=asyncio.subprocess.PIPE,stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.STDOUT)
@@ -290,28 +330,28 @@ async def main():
     token=os.getenv("DISCORD_TOKEN","")
     if not token or not cfg["guild_id"] or not cfg["owner_ids"]:
         raise RuntimeError("Configure Discord token, guild_id and owner_ids first.")
-    lock=ROOT/"runtime.lock"
-    fd=os.open(lock,os.O_CREAT|os.O_EXCL|os.O_WRONLY)
-    os.write(fd,str(os.getpid()).encode()); os.close(fd)
-    h=Host(cfg)
-    bot=Ingenium(h); h.bot=bot
-    install_commands(bot,h)
-    try:
-        if cfg.get("autostart"):
-            try: print(await h.start())
-            except Exception as e: print("Autostart failed:",e)
-        await bot.start(token)
-    finally:
-        h.closing=True
+    with runtime_guard(ROOT/"runtime.lock"):
+        h=Host(cfg)
+        bot=Ingenium(h); h.bot=bot
+        install_commands(bot,h)
         try:
-            await h.stop()
-            if h.proc and h.proc.returncode is None:
-                print("Waiting for Java to stop before releasing runtime lock.")
-                await h.proc.wait()
+            if cfg.get("autostart"):
+                try: print(await h.start())
+                except Exception as e: print("Autostart failed:",e)
+            await bot.start(token)
         finally:
-            await bot.close()
-            lock.unlink(missing_ok=True)
+            h.closing=True
+            try:
+                await h.stop()
+                if h.proc and h.proc.returncode is None:
+                    print("Waiting for Java to stop before releasing runtime lock.")
+                    await h.proc.wait()
+            finally:
+                await bot.close()
 
 if __name__=="__main__":
     try: asyncio.run(main())
     except KeyboardInterrupt: pass
+    except RuntimeError as e:
+        print("Host startup failed:", e)
+        raise SystemExit(1)
