@@ -2,13 +2,13 @@ import streamlit as st
 from mcstatus import JavaServer
 from datetime import datetime, timezone
 
-st.set_page_config(page_title="Ingenium SMP", page_icon="🌲",layout="wide")
+st.set_page_config(page_title="Ingenium SMP", page_icon="🔥",layout="wide")
 st.markdown("""
 <style>
-.stApp { background: #101713; color: #e3eee6; }
-[data-testid="stMetric"] {background:#1a2920;padding:16px;border:1px solid #344b3c;border-radius:12px;}
-[data-testid="stMetricLabel"],[data-testid="stMetricValue"] {color:#e2f3e7;}
-h1,h2,h3 {color:#b8e5c4;}
+.stApp { background: #140d0e; color: #f5e9e5; }
+[data-testid="stMetric"] {background:#261619;padding:16px;border:1px solid #67302c;border-radius:12px;}
+[data-testid="stMetricLabel"],[data-testid="stMetricValue"] {color:#fff0e7;}
+h1,h2,h3 {color:#ffad82;}
 </style>
 """,unsafe_allow_html=True)
 
@@ -32,22 +32,28 @@ def query(address):
         return {"state":"Unreachable","checked":datetime.now(timezone.utc).isoformat(timespec="seconds")}
 
 st.title("INGENIUM SMP")
+st.markdown("**THE FORGE | SERVER HUB**")
 st.caption("SURVIVAL • EXPLORATION • COMMUNITY")
 st.write("Minecraft Java 26.3 | Vanilla+ | Private whitelist")
-if st.button("Refresh status"):
-    query.clear()
-data=query(address)
-a,b,c,d=st.columns(4)
-a.metric("Server",data["state"])
-b.metric("Players",f'{data["count"]}/{data["max"]}' if "count" in data else "—")
-c.metric("Latency",f'{data["latency"]} ms' if "latency" in data else "—")
-d.metric("Datapacks",6)
-if "checked" in data:
-    st.caption("Last checked: "+data["checked"]+" | Latency measured from dashboard, not your device.")
-if data["state"]=="Unreachable":
-    st.info("The Minecraft server or tunnel is not responding. The laptop may be asleep, offline or restarting.")
-if "version" in data:
-    st.caption("Reported server version: "+data["version"])
+@st.fragment(run_every="30s")
+def live_status():
+    if st.button("Refresh status"):
+        query.clear()
+    data=query(address)
+    a,b,c,d=st.columns(4)
+    a.metric("Server",data["state"])
+    b.metric("Players",f'{data["count"]}/{data["max"]}' if "count" in data else "—")
+    c.metric("Latency",f'{data["latency"]} ms' if "latency" in data else "—")
+    d.metric("Datapacks",6)
+    if "checked" in data:
+        st.caption("Last checked: "+data["checked"]+" | Latency measured from dashboard, not your device.")
+    if data["state"]=="Unreachable":
+        st.info("The Minecraft server or tunnel is not responding. The laptop may be asleep, offline or restarting.")
+    if "version" in data:
+        st.caption("Reported server version: "+data["version"])
+    st.caption("Auto-refreshes every 30 seconds while this page is open.")
+
+live_status()
 
 st.subheader("Join the SMP")
 if address:
