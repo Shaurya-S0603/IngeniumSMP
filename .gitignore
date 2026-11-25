@@ -1,0 +1,12 @@
+server/
+backups/
+world.zip
+*.zip
+*.jar
+.env
+config.json
+.streamlit/secrets.toml
+.venv/
+__pycache__/
+*.pyc
+runtime.lock
