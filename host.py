@@ -5,6 +5,7 @@ import discord
 from discord import app_commands
 from dotenv import load_dotenv
 from mcstatus import JavaServer
+from backup_manager import due, snapshot
 
 ROOT = Path(__file__).resolve().parent
 SERVER = ROOT / "server"
@@ -95,6 +96,7 @@ class Host:
         self.proc=None
         self.desired=False
         self.lock=asyncio.Lock()
+        self.maintenance=asyncio.Lock()
         self.monitor=None
         self.bot=None
         self.closing=False
@@ -184,9 +186,11 @@ class Host:
                 text=f"{name}: {msg}" if kind=="chat" else f"{name} {kind} the game."
                 asyncio.create_task(self.send_channel("chat_channel_id",text))
         code=await p.wait()
+        if self.proc is not p:
+            return
         self.ready=False
         await self.send_channel("status_channel_id",f"Minecraft stopped (exit {code}).")
-        if self.desired and not self.closing:
+        if self.proc is p and self.desired and not self.closing:
             elapsed=asyncio.get_running_loop().time()-self.last_start
             self.failures=0 if elapsed>300 else self.failures+1
             if self.failures>3:
@@ -194,12 +198,13 @@ class Host:
                 await self.send_channel("status_channel_id","Crash recovery paused after repeated failures.")
                 return
             await asyncio.sleep(10*self.failures+5)
-            if self.desired and not self.closing:
-                try: await self.start()
-                except Exception as e:
-                    self.desired=False
-                    await self.send_channel("status_channel_id","Restart failed; check local console.")
-                    print("Restart failed:",e)
+            async with self.maintenance:
+                if self.proc is p and self.desired and not self.closing:
+                    try: await self.start()
+                    except Exception as e:
+                        self.desired=False
+                        await self.send_channel("status_channel_id","Restart failed; check local console.")
+                        print("Restart failed:",e)
 
     async def status(self):
         try:
@@ -208,15 +213,65 @@ class Host:
         except Exception:
             return "Starting or not responding." if self.proc and self.proc.returncode is None else "Offline"
 
-    async def backup(self):
-        async with self.lock:
-            if self.proc and self.proc.returncode is None:
-                return "Stop Minecraft before backing up."
-            dest=ROOT/"backups"
-            dest.mkdir(exist_ok=True)
-            name=dest/("ingenium-"+datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f"))
-            await asyncio.to_thread(shutil.make_archive,str(name),"zip",str(SERVER))
-            return "Offline backup created locally: "+name.name+".zip"
+    async def backup(self, automatic=False):
+        """Serialize with staff operations via maintenance lock in caller."""
+        if self.closing:
+            return "Host is shutting down."
+        running = self.proc is not None and self.proc.returncode is None
+        if running:
+            if not self.ready:
+                return "Backup deferred: server is still starting."
+            try:
+                for n in range(2):
+                    s=await asyncio.to_thread(lambda:JavaServer.lookup("127.0.0.1:25565",timeout=3).status())
+                    if s.players.online:
+                        return "Backup deferred: players are online."
+                    if n==0:
+                        await asyncio.sleep(10)
+            except Exception:
+                return "Backup deferred: player count unavailable."
+        try:
+            if running:
+                await self.stop()
+                if self.proc.returncode is None:
+                    return "Backup deferred: Minecraft has not stopped."
+                if self.proc.returncode != 0:
+                    return "Backup deferred: Minecraft did not exit cleanly."
+            elif self.desired:
+                return "Backup deferred: crash recovery pending."
+            async with self.lock:
+                require_free_port()
+                task=asyncio.create_task(asyncio.to_thread(snapshot, SERVER, ROOT/"backups", automatic, 7))
+                try:
+                    path=await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    # A worker thread cannot be cancelled. Wait before allowing a new server.
+                    await task
+                    raise
+            return "Verified local backup created: "+path.name
+        finally:
+            if running and not self.closing and self.proc.returncode is not None:
+                try:
+                    print(await self.start())
+                except Exception as e:
+                    print("Restart after backup failed:",e)
+                    await self.send_channel("status_channel_id","Minecraft restart after backup failed; check host console.")
+
+    async def scheduled_backups(self):
+        await asyncio.sleep(60)
+        while not self.closing:
+            try:
+                if self.cfg.get("automatic_backups",True) and due(ROOT/"backups"):
+                    async with self.maintenance:
+                        if not self.closing:
+                            result=await self.backup(automatic=True)
+                            print(result,flush=True)
+                            if result.startswith("Verified"):
+                                await self.send_channel("status_channel_id",result)
+            except Exception as e:
+                print("Automatic backup failed:",e,flush=True)
+                await self.send_channel("status_channel_id","Automatic backup failed; inspect host console.")
+            await asyncio.sleep(300)
 
 class Ingenium(discord.Client):
     def __init__(self,host):
@@ -255,7 +310,11 @@ def install_commands(bot,h):
             return
         await i.response.defer(ephemeral=admin,thinking=True)
         try:
-            result=await fn()
+            if admin:
+                async with h.maintenance:
+                    result=await fn()
+            else:
+                result=await fn()
         except Exception as e:
             print("Command error:",e)
             result="Operation failed. Check the host console."
@@ -297,7 +356,7 @@ def install_commands(bot,h):
             return await h.start()
         await run(i,result,True)
 
-    @tree.command(name="backup",description="Back up stopped server (staff)")
+    @tree.command(name="backup",description="Back up server when empty or stopped (staff)")
     async def backup(i:discord.Interaction):
         await run(i,h.backup,True)
 
@@ -334,13 +393,19 @@ async def main():
         h=Host(cfg)
         bot=Ingenium(h); h.bot=bot
         install_commands(bot,h)
+        schedule=None
         try:
             if cfg.get("autostart"):
                 try: print(await h.start())
                 except Exception as e: print("Autostart failed:",e)
+            schedule=asyncio.create_task(h.scheduled_backups())
             await bot.start(token)
         finally:
             h.closing=True
+            if schedule:
+                schedule.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await schedule
             try:
                 await h.stop()
                 if h.proc and h.proc.returncode is None:
