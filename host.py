@@ -1,6 +1,8 @@
 """IngeniumBot and local Minecraft supervisor."""
 import asyncio, contextlib, datetime, hashlib, json, os, re, shutil, socket, uuid
 from pathlib import Path
+from collections import deque
+import sys, threading
 import discord
 from discord import app_commands
 from dotenv import load_dotenv
@@ -57,10 +59,6 @@ def require_free_port():
 
 def load_config():
     c = json.loads(CONFIG.read_text(encoding="utf-8"))
-    if not isinstance(c["whitelist"], list) or not all(isinstance(n,str) and NAME.fullmatch(n) for n in c["whitelist"]):
-        raise ValueError("Invalid whitelist usernames")
-    if len({n.lower() for n in c["whitelist"]}) != len(c["whitelist"]):
-        raise ValueError("Duplicate case-insensitive whitelist usernames")
     if not 2 <= int(c["max_ram_gb"]) <= 12:
         raise ValueError("RAM must be between 2 and 12 GB")
     return c
@@ -103,6 +101,7 @@ class Host:
         self.ready=False
         self.failures=0
         self.last_start=0
+        self.console_lines=deque(maxlen=200)
 
     async def send_channel(self, key, text):
         if not self.bot or not self.bot.is_ready():
@@ -121,15 +120,13 @@ class Host:
             raise RuntimeError("EasyAuth jar missing; refusing offline-mode startup.")
         if "eula=true" not in (SERVER/"eula.txt").read_text().splitlines():
             raise RuntimeError("Read and explicitly accept the Minecraft EULA.")
-        if not self.cfg["whitelist"]:
-            raise RuntimeError("Configure exact existing usernames first.")
         props={}
         for line in (SERVER/"server.properties").read_text().splitlines():
             if "=" in line and not line.startswith("#"):
                 k,v=line.split("=",1); props[k]=v
-        props.update({"server-ip":"127.0.0.1","server-port":"25565","online-mode":"false","enforce-secure-profile":"false","white-list":"true","enforce-whitelist":"true","enable-rcon":"false","enable-query":"false","level-name":"world","max-players":"10","pause-when-empty-seconds":"-1"})
+        props.update({"server-ip":"127.0.0.1","server-port":"25565","online-mode":"false","enforce-secure-profile":"false","white-list":"false","enforce-whitelist":"false","enable-rcon":"false","enable-query":"false","level-name":"world","max-players":"10","pause-when-empty-seconds":"-1"})
         (SERVER/"server.properties").write_text("\n".join(k+"="+v for k,v in props.items())+"\n",encoding="utf-8")
-        (SERVER/"whitelist.json").write_text(json.dumps([{"uuid":offline_uuid(n),"name":n} for n in self.cfg["whitelist"]],indent=2),encoding="utf-8")
+        # Preserve any existing whitelist.json; access is disabled at startup.
         # No offline-mode in-game operator accounts.
         (SERVER/"ops.json").write_text("[]\n",encoding="utf-8")
 
@@ -177,6 +174,7 @@ class Host:
             if not line: break
             s=line.decode("utf-8",errors="replace").rstrip()
             print(s,flush=True)
+            self.console_lines.append(s[:2000])
             if "Done (" in s and "help" in s.lower():
                 self.ready=True
                 asyncio.create_task(self.send_channel("status_channel_id","Minecraft is ready."))
@@ -205,6 +203,47 @@ class Host:
                         self.desired=False
                         await self.send_channel("status_channel_id","Restart failed; check local console.")
                         print("Restart failed:",e)
+
+    async def console_command(self, raw):
+        """Call with the maintenance lock held; never expose stdin publicly."""
+        cmd=raw.strip()
+        if cmd.startswith("/"):
+            cmd=cmd[1:].strip()
+        if not cmd or len(cmd)>1000 or any(ord(ch)<32 for ch in cmd):
+            raise ValueError("Enter one nonempty Minecraft command (up to 1000 characters).")
+        if self.closing:
+            return "Host is shutting down."
+        verb=cmd.split(None,1)[0].lower()
+        if cmd.lower() in ("stop","minecraft:stop"):
+            return await self.stop()
+        if verb in ("stop","minecraft:stop"):
+            return "Use stop without arguments."
+        if cmd.lower()==":start":
+            return await self.start()
+        if cmd.lower()==":restart":
+            await self.stop()
+            if self.proc and self.proc.returncode is None:
+                return "Restart deferred: Java has not stopped."
+            return await self.start()
+        if cmd.lower()==":backup":
+            return await self.backup()
+        if cmd.lower()==":status":
+            return await self.status()
+        if not self.ready:
+            return "Minecraft is not ready. Use :start or wait for startup."
+        await self.command(cmd)
+        return "Command sent to Minecraft. Read the local console or /console_logs for output."
+
+    def console_tail(self, count=20):
+        """Bounded, best-effort filtered log excerpt for private staff responses."""
+        count=max(1,min(50,count))
+        lines=[]
+        for line in list(self.console_lines)[-count:]:
+            if re.search(r"(?i)(password|passwd|token|secret|credential|/register\b|/login\b|easyauth|authme|authorization|api[_ -]?key)",line):
+                lines.append("[Sensitive authentication-related line omitted]")
+            else:
+                lines.append(discord.utils.escape_markdown(line,as_needed=False))
+        return ("\n".join(lines)[-1650:] or "No recent Minecraft console output.") 
 
     async def status(self):
         try:
@@ -298,12 +337,61 @@ class Ingenium(discord.Client):
         with contextlib.suppress(RuntimeError,OSError):
             await h.command(relay(message.author.display_name,message.content))
 
+def is_console_admin(interaction, guild_id):
+    """Guild owner or actual Administrator permission; never trust a role name."""
+    guild=interaction.guild
+    if guild is None or interaction.guild_id!=guild_id:
+        return False
+    user=interaction.user
+    return user.id==guild.owner_id or bool(getattr(getattr(user,"guild_permissions",None),"administrator",False))
+
+
+def start_local_console(host):
+    """A daemon reader keeps blocking Windows console input off the asyncio loop."""
+    if sys.stdin is None or not sys.stdin.isatty():
+        print("[CONSOLE] No interactive terminal; staff Discord commands remain available.",flush=True)
+        return
+    loop=asyncio.get_running_loop()
+
+    async def dispatch(line):
+        async with host.maintenance:
+            if host.closing:
+                return "Host is shutting down."
+            return await host.console_command(line)
+
+    def reader():
+        print("[CONSOLE] Local console ready. Type Minecraft commands, or :start, :restart, :backup, :status. Ctrl+C exits.",flush=True)
+        while not host.closing:
+            try:
+                line=sys.stdin.readline()
+            except (OSError,ValueError):
+                return
+            if not line or host.closing:
+                return
+            if not line.strip():
+                continue
+            coro=dispatch(line.rstrip("\r\n"))
+            try:
+                future=asyncio.run_coroutine_threadsafe(coro,loop)
+            except RuntimeError:
+                coro.close()
+                return
+            try:
+                print("[CONSOLE] "+future.result(),flush=True)
+            except Exception as exc:
+                if host.closing:
+                    return
+                print("[CONSOLE] Command failed: "+str(exc),flush=True)
+
+    threading.Thread(target=reader,name="ingenium-console",daemon=True).start()
+
+
 def install_commands(bot,h):
     tree=bot.tree
     def member(i):
         return i.guild_id==h.cfg["guild_id"]
     def staff(i):
-        return member(i) and i.user.id in h.cfg["owner_ids"]
+        return is_console_admin(i,h.cfg["guild_id"])
     async def run(i,fn,admin=False):
         if not (staff(i) if admin else member(i)):
             await i.response.send_message("Not authorized.",ephemeral=True)
@@ -312,7 +400,7 @@ def install_commands(bot,h):
         try:
             if admin:
                 async with h.maintenance:
-                    result=await fn()
+                    result=await fn() if staff(i) and not h.closing else "Not authorized or host shutting down."
             else:
                 result=await fn()
         except Exception as e:
@@ -360,7 +448,30 @@ def install_commands(bot,h):
     async def backup(i:discord.Interaction):
         await run(i,h.backup,True)
 
+    @tree.command(name="console",description="Run a Minecraft console command (owner/admin only)")
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.describe(command="One Minecraft command, e.g. list or time set day")
+    async def console(i:discord.Interaction, command:str):
+        async def result():
+            # Do not print raw Discord command arguments to logs.
+            print(f"[CONSOLE] Authorized Discord command requested by user {i.user.id}",flush=True)
+            try:
+                return await h.console_command(command)
+            except ValueError as exc:
+                return str(exc)
+        await run(i,result,True)
+
+    @tree.command(name="console_logs",description="View recent private Minecraft console logs (owner/admin only)")
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.describe(lines="Number of recent lines, 1 to 50")
+    async def console_logs(i:discord.Interaction, lines:app_commands.Range[int,1,50]=20):
+        if not staff(i):
+            await i.response.send_message("Not authorized.",ephemeral=True)
+            return
+        await i.response.send_message(h.console_tail(lines),ephemeral=True,allowed_mentions=NO_MENTIONS)
+
     @tree.command(name="setup_channels",description="Create Ingenium SMP channels (server owner)")
+
     async def setup_channels(i:discord.Interaction):
         if not staff(i) or not i.guild or i.guild.owner_id!=i.user.id:
             await i.response.send_message("Server owner only.",ephemeral=True)
@@ -399,6 +510,7 @@ async def main():
                 try: print(await h.start())
                 except Exception as e: print("Autostart failed:",e)
             schedule=asyncio.create_task(h.scheduled_backups())
+            start_local_console(h)
             await bot.start(token)
         finally:
             h.closing=True
@@ -407,10 +519,11 @@ async def main():
                 with contextlib.suppress(asyncio.CancelledError):
                     await schedule
             try:
-                await h.stop()
-                if h.proc and h.proc.returncode is None:
-                    print("Waiting for Java to stop before releasing runtime lock.")
-                    await h.proc.wait()
+                async with h.maintenance:
+                    await h.stop()
+                    if h.proc and h.proc.returncode is None:
+                        print("Waiting for Java to stop before releasing runtime lock.")
+                        await h.proc.wait()
             finally:
                 await bot.close()
 
